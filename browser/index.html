@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Browser inference demo</title>
+
+    <style>
+        #features {
+            width: 50%;
+            font-size: 18px;
+        }
+
+        #results {
+            font-family: monospace;
+            white-space: pre;
+        }
+    </style>
+</head>
+<body>
+    <h1></h1>
+<p>
+    <input type="text" id="features" placeholder="Paste your features here">
+</p>
+<p>
+    <button id="run-inference">Run inference</button>
+    <button id="start-mic">Start Microphone</button>
+</p>
+<p id="mic-results"></p>
+<p id="results"></p>
+
+<script src="edge-impulse-standalone.js"></script>
+<script src="run-impulse.js"></script>
+<script>
+(async () => {
+    const classifier = new EdgeImpulseClassifier();
+    await classifier.init();
+
+    // モデル情報を表示
+    const project = classifier.getProjectInfo();
+    document.querySelector('h1').textContent = 
+        project.owner + ' / ' + project.name + ' (version ' + project.deploy_version + ')';
+
+    // 手動で特徴量を貼り付けて推論
+    document.querySelector('#run-inference').onclick = () => {
+        try {
+            const features = document.querySelector('#features').value
+                                .split(',')
+                                .map(x => Number(x.trim()));
+            const res = classifier.classify(features);
+            document.querySelector('#results').textContent = JSON.stringify(res, null, 4);
+        } catch(ex) {
+            alert('Failed to classify: ' + (ex.message || ex.toString()));
+        }
+    };
+
+    // マイクでリアルタイム推論
+    document.getElementById('start-mic').onclick = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(stream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+
+            processor.onaudioprocess = (e) => {
+                const inputData = e.inputBuffer.getChannelData(0);
+                // モデルによっては preProcess が必要
+                const features = classifier.preProcess(inputData); 
+                const result = classifier.classify(features);
+                document.getElementById('mic-results').textContent = JSON.stringify(result, null, 2);
+            };
+        } catch(ex) {
+            alert('Failed to start microphone: ' + (ex.message || ex.toString()));
+        }
+    };
+})();
+ </script>
+</body>
+</html>
