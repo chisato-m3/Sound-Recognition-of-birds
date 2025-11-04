@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Mating Sound Classifier</title>
+<style>
+    body { font-family: sans-serif; text-align: center; margin-top: 40px; }
+    #mic-results { font-size: 32px; font-weight: bold; margin-top: 20px; color: #333; }
+    button { font-size: 20px; padding: 10px 20px; margin: 10px; }
+</style>
+</head>
+<body>
+<h1>Edge Impulse Mating Sound Classifier</h1>
+
+<p>
+    <button id="start-mic">Start Microphone</button>
+</p>
+
+<p id="mic-results">---</p>
+
+<script src="edge-impulse-standalone.js"></script>
+<script src="run-impulse.js"></script>
+<script>
+(async () => {
+    const classifier = new EdgeImpulseClassifier();
+    await classifier.init();
+//sesami用
+    function hexToBytes(hex) {
+    const clean = hex.replace(/^0x/i, "");
+    if (clean.length % 2 !== 0) throw new Error("Invalid hex length");
+    const out = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < out.length; i++) {
+        out[i] = parseInt(clean.substr(i*2,2),16);
+    }
+    return out;
+}
+
+function bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2,"0")).join("");
+}
+
+function xor16(a,b){
+    const out = new Uint8Array(16);
+    for (let i=0;i<16;i++) out[i]=a[i]^b[i];
+    return out;
+}
+
+function leftShiftOneBit128(block){
+    const out = new Uint8Array(16);
+    let carry = 0;
+    for(let i=15;i>=0;i--){
+        const val = (block[i]<<1)&0xFF;
+        out[i] = val | carry;
+        carry = (block[i]&0x80)?1:0;
+    }
+    return { out, carry };
+}
+
+function rbConst(){
+    const Rb = new Uint8Array(16);
+    Rb[15]=0x87;
+    return Rb;
+}
+
+async function aesEncryptBlockAesCbc(keyRaw, block){
+    const key = await crypto.subtle.importKey("raw", keyRaw, {name:"AES-CBC", length:128}, false, ["encrypt"]);
+    const iv = new Uint8Array(16);
+    const ct = await crypto.subtle.encrypt({name:"AES-CBC", iv}, key, block);
+    return new Uint8Array(ct).slice(0,16);
+}
+
+async function aesCmac(keyRaw, message){
+    const zero = new Uint8Array(16);
+    const L = await aesEncryptBlockAesCbc(keyRaw, zero);
+    const { out: K1tmp, carry: c1 } = leftShiftOneBit128(L);
+    const K1 = c1 ? xor16(K1tmp, rbConst()) : K1tmp;
+    const { out: K2tmp, carry: c2 } = leftShiftOneBit128(K1);
+    const K2 = c2 ? xor16(K2tmp, rbConst()) : K2tmp;
+
+    let lastBlock;
+    if(message.length===16 && message.length%16===0){
+        lastBlock = xor16(message,K1);
+    } else {
+        const m = new Uint8Array(16);
+        m.set(message,0);
+        m[message.length]=0x80;
+        lastBlock = xor16(m,K2);
+    }
+
+    const tag = await aesEncryptBlockAesCbc(keyRaw,lastBlock);
+    return tag;
+}
+
+async function generateRandomTag(secretHex){
+    const key = hexToBytes(secretHex);
+    if(key.length!==16) throw new Error("key_secret_hex must be 16 bytes (32 hex chars) for AES-128.");
+    const date = Math.floor(Date.now()/1000);
+    const view = new DataView(new ArrayBuffer(4));
+    view.setUint32(0,date,true);
+    const le4 = new Uint8Array(view.buffer);
+    const message = le4.slice(1,4);
+    const mac = await aesCmac(key,message);
+    return bytesToHex(mac);
+}
+//doSesami
+    async function doSesami(cmd) {
+    const sesame_id = "1120041E-0507-0609-4F00-5E00FFFFFFFF";
+    const sesame_api_key = "R33T17oRKl1sUqyZzZ2CH5wzWxBrWa9h3RtO6Ujx";
+    const key_secret_hex = "59b4a6d5e6c9ed863ad58bfb7df145e5";
+    const history = "Triggered via classifier";
+
+    // 署名を作成
+    const sign = await generateRandomTag(key_secret_hex);
+
+    // APIに送信
+    const res = await fetch(`https://app.candyhouse.co/api/sesame2/${encodeURIComponent(sesame_id)}/cmd`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": sesame_api_key },
+        body: JSON.stringify({ cmd, history: btoa(unescape(encodeURIComponent(history))), sign })
+    });
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`API error: ${res.status} ${res.statusText} ${text}`);
+    }
+    const after_cmd = await res.json().catch(() => ({}));
+    console.log("Sesame OK:", after_cmd);
+}
+//sesami終了
+     let matingStart=null;
+     let nonmatingStart=null;
+    document.getElementById('start-mic').onclick = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioCtx.createMediaStreamSource(stream);
+            const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
+            processor.onaudioprocess = (e) => {
+                const inputData = e.inputBuffer.getChannelData(0);
+
+                try {
+                    const result = classifier.classifyContinuous(inputData);
+                    // 上位ラベルだけ表示（例: mating / non-mating）
+                    const top = result.results.reduce((a,b)=>a.value>b.value?a:b);
+                    const labelEl = document.getElementById('mic-results');
+                    labelEl.textContent = top.label;
+                    labelEl.style.color = top.label === "mating" ? "red" : "blue";
+
+                    const now=Date.now();
+                    // ===== Sesame制御部分 =====
+        if(top.label === "mating") {
+            // 右回り
+            if(matingStart===null) matingStart=now;
+            nonmatingStart=null;
+            if(now-matingStart >=1000){
+                doSesami(127).catch(err => console.error(err)); 
+                                doSesami(127).catch(err => console.error(err)); 
+                matingStart=null;
+            }
+    
+        } else {
+            if(nonmatingStart===null) nonmatingStart=now;
+            matingStart=null;
+            if(now-nonmatingStart >=5000){
+                doSesami(-127).catch(err => console.error(err)); 
+                nonmatingStart=null;
+            }
+        }
+        // =========================
+                } catch(err) {
+                    console.error("Classification failed:", err);
+                }
+            };
+
+        } catch(err) {
+            alert('Failed to start microphone: ' + (err.message || err));
+        }
+    };
+})();
+</script>
+</body>
+</html>
